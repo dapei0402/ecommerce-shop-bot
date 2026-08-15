@@ -138,12 +138,14 @@ def init_db():
                 coupon_code TEXT,
                 referrer_id INTEGER,
                 referral_awarded INTEGER DEFAULT 0,
+                stock_restored INTEGER DEFAULT 0,
                 FOREIGN KEY (referrer_id) REFERENCES users(id)
             );
 
             CREATE TABLE IF NOT EXISTS order_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id INTEGER NOT NULL,
+                variant_id INTEGER,
                 variant_name TEXT NOT NULL,
                 product_name TEXT NOT NULL,
                 quantity INTEGER NOT NULL,
@@ -218,6 +220,12 @@ def init_db():
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
         if "referral_awarded" not in cols:
             conn.execute("ALTER TABLE orders ADD COLUMN referral_awarded INTEGER DEFAULT 0")
+        if "stock_restored" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN stock_restored INTEGER DEFAULT 0")
+        # 轻量迁移：order_items 补 variant_id 列（取消订单时回滚库存需要）
+        oi_cols = {r["name"] for r in conn.execute("PRAGMA table_info(order_items)").fetchall()}
+        if "variant_id" not in oi_cols:
+            conn.execute("ALTER TABLE order_items ADD COLUMN variant_id INTEGER")
 
 # ====================================================================
 #  数据库操作函数
@@ -404,9 +412,10 @@ def db_create_order(user_id, username, full_name, phone, address, coupon_code=No
         order_id = cur.lastrowid
         for item in cart:
             conn.execute(
-                """INSERT INTO order_items (order_id, variant_name, product_name, quantity, unit_price)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (order_id, item["variant_name"], item["product_name"], item["quantity"], item["price"])
+                """INSERT INTO order_items (order_id, variant_id, variant_name, product_name, quantity, unit_price)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (order_id, item["variant_id"], item["variant_name"], item["product_name"],
+                 item["quantity"], item["price"])
             )
             conn.execute("UPDATE product_variants SET stock = stock - ? WHERE id=?",
                          (item["quantity"], item["variant_id"]))
@@ -424,6 +433,60 @@ def db_get_order_items(order_id):
 def db_update_order_status(order_id, status):
     with closing(get_conn()) as conn, conn:
         conn.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
+
+def cancel_order_and_restore(order_id, operator_id=0):
+    """
+    取消订单并做资金/库存回滚（单事务，幂等）：
+      - 回滚库存（把订单内每个规格的数量加回，仅第一次）
+      - 若该订单已付款，把 final_price 退回买家钱包并记流水
+      - 若已发放过邀请返佣，扣回返佣
+      - 订单状态置为 cancelled、支付状态置为 unpaid
+    返回 (user_id, refunded_amount) 或错误字符串。
+    """
+    with closing(get_conn()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        if not order:
+            return "订单不存在"
+        if order["status"] == "cancelled":
+            return "该订单已取消"
+
+        # 1) 回滚库存（幂等：stock_restored 标记）
+        if order["stock_restored"] == 0:
+            items = conn.execute("SELECT variant_id, quantity FROM order_items WHERE order_id=?",
+                                 (order_id,)).fetchall()
+            for it in items:
+                if it["variant_id"]:
+                    conn.execute("UPDATE product_variants SET stock = stock + ? WHERE id=?",
+                                 (it["quantity"], it["variant_id"]))
+            conn.execute("UPDATE orders SET stock_restored=1 WHERE id=?", (order_id,))
+
+        # 2) 已付款则退款到钱包
+        refunded = 0
+        if order["payment_status"] == "paid" and order["final_price"] > 0:
+            conn.execute("UPDATE users SET wallet_balance = wallet_balance + ? WHERE id=?",
+                         (order["final_price"], order["user_id"]))
+            conn.execute(
+                "INSERT INTO wallet_transactions (user_id, amount, description, created_at) VALUES (?, ?, ?, ?)",
+                (order["user_id"], order["final_price"], f"订单 #{order_id} 取消退款", datetime.now().isoformat())
+            )
+            refunded = order["final_price"]
+
+        # 3) 已发放返佣则扣回
+        if order["referral_awarded"] == 1 and order["referrer_id"]:
+            bonus = int(order["final_price"] * REFERRAL_BONUS_PERCENT / 100)
+            if bonus > 0:
+                conn.execute("UPDATE users SET wallet_balance = wallet_balance - ? WHERE id=?",
+                             (bonus, order["referrer_id"]))
+                conn.execute(
+                    "INSERT INTO wallet_transactions (user_id, amount, description, created_at) VALUES (?, ?, ?, ?)",
+                    (order["referrer_id"], -bonus, f"订单 #{order_id} 取消，扣回返佣", datetime.now().isoformat())
+                )
+            conn.execute("UPDATE orders SET referral_awarded=0 WHERE id=?", (order_id,))
+
+        # 4) 更新状态
+        conn.execute("UPDATE orders SET status='cancelled', payment_status='unpaid' WHERE id=?", (order_id,))
+        return order["user_id"], refunded
 
 def db_update_order_payment_status(order_id, payment_status):
     with closing(get_conn()) as conn, conn:
@@ -1346,6 +1409,28 @@ async def order_status_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     _, order_id_str, new_status = query.data.split(":")
     order_id = int(order_id_str)
+
+    # 取消订单：走回滚流程（回库存 + 已付款则退款 + 扣回返佣）
+    if new_status == "cancelled":
+        result = cancel_order_and_restore(order_id, operator_id=query.from_user.id)
+        if isinstance(result, str):
+            await query.answer(result, show_alert=True)
+            return
+        buyer_id, refunded = result
+        await query.answer("订单已取消，库存已回滚。")
+        try:
+            msg = f"你的订单 #{order_id} 已被取消。"
+            if refunded > 0:
+                msg += f"\n已退款 {format_price(refunded)} 到你的钱包。"
+            await context.bot.send_message(chat_id=buyer_id, text=msg)
+        except Exception:
+            pass
+        note = f"订单 #{order_id} 已取消，库存已回滚。"
+        if refunded > 0:
+            note += f" 已退款 {format_price(refunded)}。"
+        await query.edit_message_text(note)
+        return
+
     db_update_order_status(order_id, new_status)
     await query.answer(f"状态已改为 {STATUS_LABELS.get(new_status, new_status)}。")
     order = db_get_order(order_id)
