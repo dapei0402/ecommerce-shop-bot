@@ -697,8 +697,6 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ====================================================================
 #  顾客端：商品目录（含多规格）
 # ====================================================================
-# 说明：原版给 InlineKeyboardButton 传了 style= 参数，标准 python-telegram-bot
-#       不支持该参数，会抛 TypeError 导致按钮无法生成。本版已全部移除。
 
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
     categories = db_get_categories()
